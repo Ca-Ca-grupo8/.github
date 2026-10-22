@@ -67,273 +67,419 @@ A arquitetura está documentada no padrão [C4](https://c4model.com/) em
 
 ---
 
-## 3. BackEnd — API REST de estoque
+## Nível 1 — Diagrama de contexto
 
-Spring Boot **4.0.5** / Java **21**, Maven único em `BackEnd/estoque/`.
+Quem usa o sistema, com quem ele interage e o que existe fora dos nossos limites.
 
-### Comandos (sempre a partir de `BackEnd/estoque/`)
+```mermaid
+flowchart TD
+    admin["Administrador<br/><i>ROLE_ADMIN</i>"]
+    func["Funcionária / operadora<br/><i>ROLE_USER</i>"]
+    rev["Revendedora<br/><i>não acessa o sistema — só recebe e-mails</i>"]
 
-| Ação | Comando |
-| --- | --- |
-| Testes | `mvn test` |
-| Suíte + gate de cobertura | `mvn verify` |
-| Um teste | `mvn test -Dtest=JoiaServiceTest` |
-| Teste com `@Nested` | `mvn test -Dtest='JoiaServiceTest*'` |
-| Pular JaCoCo | `mvn test -Djacoco.skip=true` |
-| Subir a API | `mvn spring-boot:run` |
+    caeca["Sistema Ca&Cá<br/>Gestão de estoque de semijoias"]
 
-- `mvn verify` **falha se branch coverage < 70%** (JaCoCo). Sempre adicione testes junto com código.
-- Não existe `mvnw` funcional; use `mvn` do sistema (3.8+).
-- Suíte: ~200 testes em 28 classes, ~1,5 min. Roda offline com `-o` após o 1º build.
+    brevo["Brevo<br/>CRM / e-mails transacionais"]
+    viacep["ViaCEP<br/>consulta de CEP"]
+    aws["AWS Cloud<br/>S3 · EventBridge · Lambda"]
 
-### Configuração
+    admin -->|"gerencia cadastros, convites e<br/>configurações (categorias, banhos, materiais, fornecedores)"| caeca
+    func -->|"registra movimentações, opera inventário,<br/>maletas e consulta dashboards"| caeca
+    rev -->|"lê e-mails de consignação, alertas<br/>e convites de primeiro acesso"| brevo
+    caeca -->|"publica eventos de notificação<br/>(e-mail transacional)"| brevo
+    caeca -->|"consulta CEP (SPA chama direto)"| viacep
+    caeca -->|"armazena fotos de joias, data lake<br/>e rotinas agendadas"| aws
 
-Fonte: `BackEnd/estoque/src/main/resources/application.properties`
+    classDef pessoa fill:#08427B,stroke:#052E56,color:#fff
+    classDef sistema fill:#1168BD,stroke:#0B4884,color:#fff
+    classDef externo fill:#999999,stroke:#6B6B6B,color:#fff
+    class admin,func,rev pessoa
+    class caeca sistema
+    class brevo,viacep,aws externo
+```
 
-| Variável | Default | Obrigatória |
+**Atos do sistema:** autenticar usuários (JWT), cadastrar manutenção de dados
+(joias, categorias, banhos, materiais, motivos), registrar movimentações de estoque,
+gerenciar maletas/vendas de revendedoras, exibir dashboards e disparar notificações
+assíncronas por e-mail.
+
+---
+
+## Nível 2 — Diagrama de contêineres
+
+Contêineres = unidades de código executando em seu próprio processo (SPA, API,
+banco, fila, buckets, functions).
+
+```mermaid
+flowchart TD
+    navegador["Navegador\n[Container: Navegador Web]\nInterface utilizada pelos usuários para acessar o sistema"]
+
+    subgraph aws["AWS — conta do projeto"]
+        subgraph app["Compute"]
+            spa["Aplicação Front-end\n[Container: React 19 + Vite 8 + Nginx Alpine]\nInterface web responsável pela interação com o sistema"]
+            api["Aplicação Back-end\n[Container: Java 21 + Spring Boot 4]\nAplicação principal que gerencia a conexão com banco de dados, API e mensageria"]
+        end
+        subgraph dados["Persistência"]
+            mysql[("Banco de Dados\n[Container: MySQL 8.0]\nArmazena usuários, joias, movimentações, maletas e demais dados transacionais")]
+            fotos[("Armazenamento de Imagens\n[Container: Amazon S3]\nArmazena as fotos das joias cadastradas no sistema")]
+            lake[("Data Lake\n[Container: Amazon S3]\nArmazena os dados em camadas Bronze / Silver / Gold para análises futuras")]
+            lambda["Função de Ingestão Bronze\n[Container: AWS Lambda (Python 3.11)]\nExecuta a ingestão mensal de dados para a camada Bronze do Data Lake — Stub"]
+        end
+        subgraph mensag["Mensageria"]
+            rabbit[("Broker de Mensagens\n[Container: RabbitMQ 3]\nGerencia a fila assíncrona para envio de notificações por e-mail")]
+        end
+    end
+
+    brevo["Brevo\n[Container: Brevo API]\nServiço externo responsável pelo envio de e-mails transacionais"]
+    viacep["ViaCEP\n[Container: ViaCEP API]\nServiço externo responsável pela consulta e autocompletar de CEPs"]
+
+    navegador -->|"HTML/JS/CSS (SPA)"| spa
+    navegador -->|"JSON sobre /api/* + cookie authToken<br/>(proxy nginx/vite → :8080)"| api
+    spa -->|"axios com withCredentials"| api
+    api -->|"JPA / JDBC — entidades e saldos"| mysql
+    api -->|"SDK v2 — PUT/GET/DELETE de imagens"| fotos
+    api -->|"publica NotificacaoEventoDto"| rabbit
+    rabbit -->|"consumo (CrmNotificadorConsumer)"| api
+    api -->|"OpenFeign HTTPS — e-mail transacional"| brevo
+    spa -->|"fetch direto — consulta CEP<br/>(viacepApi.js)"| viacep
+    lambda -->|"grava camada bronze"| lake
+
+    classDef sistema fill:#1168BD,stroke:#0B4884,color:#fff
+    classDef cont fill:#438DD5,stroke:#1168BD,color:#fff
+    classDef dado fill:#DDDDDD,stroke:#6B6B6B,color:#000
+    classDef ext fill:#999999,stroke:#6B6B6B,color:#fff
+    classDef stub fill:#EEEEEE,stroke:#999999,color:#666,stroke-dasharray: 4 3
+    class spa,api sistema
+    class brevo,viacep,rabbit ext
+    class mysql,fotos,lake dado
+    class lambda stub
+```
+
+### Tabela de contêineres
+
+| Contêiner | Tecnologia | Responsabilidade |
 | --- | --- | --- |
-| `JWT_SECRET` | — | **sim** (Base64, `openssl rand -base64 48`) |
-| `BREVO_API_KEY` | — | **sim** |
-| `JWT_VALIDITY` | `1800` | não |
-| `APP_STORAGE_TYPE` | `s3` | não |
-| `APP_STORAGE_S3_BUCKET` | `bucket-fotos-caeca` | não |
-| `APP_STORAGE_S3_REGION` | `us-east-1` | não |
+| **SPA** | React 19, Vite 8, React Router 7, axios, lucide-react (JS puro, sem TS) | UI: login, dashboard, movimentações, inventário, maletas, contribuintes (revendedoras/fornecedores/funcionários). Servida por nginx; `nginx.conf` faz `location /api/ → api.backend:8080` |
+| **API** | Spring Boot 4.0.5 (MVC, Security 7, Data JPA), Maven único `estoque/` | REST (`controller` → `service` → `database`), JWT stateless, strategies de movimentação, rotinas `@Scheduled`, notificações via fila |
+| **MySQL 8** | `mysql:8.0` em EC2, `ddl-auto=update` + Flyway (migrações Java) | Fonte única de dados transacionais (banco `caeca`) |
+| **RabbitMQ** | `rabbitmq:3-management`, porta 5672 só para o SG do backend | Desacopla eventos de negócio do envio de e-mails (fila durável `caecaFila`) |
+| **S3 fotos** | `bucket-fotos-caeca` (CloudFormation) | Imagens das joias; acesso público de leitura |
+| **Data lake** | `bucket-bronze/silver/gold-caeca` (CloudFormation) | Camadas do lake — suporte ao `analiseDados/` |
+| **Lambda bronze** | `funcao-python-bronze` + EventBridge `cron(0 9 1 * ? *)` | Ingestão mensal p/ bronze — **stub** (código placeholder) |
+| **Brevo** | API externa (Feign) | E-mails transacionais/CRM (templates: boas-vindas, aniversário, estoque baixo, peça parada, consignação, vencimento de maleta, convite) |
+| **ViaCEP** | API externa | Autocompletar endereços — chamado **direto pelo SPA** (`service/viacepApi.js` → `fetch https://viacep.com.br/ws/{cep}/json/`). O backend mantém endpoint legado `GET /enderecos/cep/{cep}` (`ViaCepClient`/Feign), não usado pelo front |
 
-Banco local: `jdbc:mysql://localhost:3306/caeca` · `root` / `root`.
-Upload multipart limitado a **10 MB**.
+---
 
-⚠️ O `.env.example` **não é lido** por nada (não há dotenv). Exporte as variáveis no shell
-ou configure no run config da IDE. Ao criar uma property obrigatória sem default,
-adicione **também** em `src/test/resources/application.properties`, senão
-`EstoqueApplicationTests.contextLoads` quebra.
-
-⚠️ **Sem seed de dados.** `ddl-auto=update` cria o schema a partir das entidades e não há
-`schema.sql`/`data.sql`. Para obter um token local é preciso inserir um usuário direto no MySQL.
-
-### Arquitetura
+## Nível 3 — Componentes da API (BackEnd)
 
 Fluxo fixo: `controller` → `service` → `database/{model,repository}`.
 
-```
-com.caeca.estoque
-├── controller/<dominio>   # @RestController por domínio
-├── service/<dominio>      # regra de negócio
-├── database/model         # entidades JPA
-├── database/repository    # Spring Data
-├── dto/<dominio>          # DTOs de entrada/saída
-├── strategy/movimentacao  # Entrada | Saida | Reentrada
-├── strategy/arquivo       # impl S3
-├── config/                # SecurityConfiguracao, CORS, Swagger
-├── consumer/              # CrmNotificadorConsumer (async → Brevo)
-├── client/                # BrevoClient (Feign)
-├── exception/, handler/   # exceções + GlobalExceptionHandler
+```mermaid
+flowchart TD
+    subgraph api["Aplicação Back-end\n[Container: Java 21 + Spring Boot 4]\nAplicação principal que gerencia a conexão com banco de dados, API e mensageria"]
+        ctrl["Controllers\n[Container: Spring MVC @RestController]\nCamada de entrada, validação, tratamento de requisições e autorização"]
+        svc["Services\n[Container: Camada de Negócio]\nRegras de domínio, orquestração e controle de transações"]
+        rot["Scheduled Jobs\n[Container: Spring @Scheduled]\nRotinas automatizadas diárias (08:00) e mensais (dia 1 às 09:00)"]
+        strat["Movimentação Strategy\n[Container: Strategy Pattern]\nImplementações: EntradaStrategy, SaidaStrategy e ReentradaStrategy"]
+        arq["Arquivo Strategy\n[Container: Strategy Pattern]\nImplementação: ArquivoS3Strategy para abstração do armazenamento de arquivos"]
+        dto["DTOs + Mappers\n[Container: Camada de Transporte]\nResponsável pelo mapeamento entre DTOs e Entidades JPA"]
+        repo["Repositories\n[Container: Spring Data JPA]\nCamada de acesso a dados com suporte à paginação"]
+        model["Entities\n[Container: JPA Entities]\nModelagem das entidades de domínio do sistema"]
+        prod["Notificação Producer\n[Container: RabbitMQ Publisher]\nPublica eventos de notificação na fila caecaFila"]
+        cons["Notificação Consumer\n[Container: RabbitMQ Listener]\nConsome eventos da fila e encaminha para o serviço de e-mail"]
+        feign["Feign Clients\n[Container: Spring Cloud OpenFeign]\nClientes HTTP para integração com Brevo e ViaCEP (legado)"]
+        sec["Configurações\n[Container: Spring Security + Config]\nConfiguração de JWT, CORS, S3, Swagger e OpenAPI"]
+        exc["Exception Handler\n[Container: Spring @ControllerAdvice]\nTratamento global de exceções de domínio e retorno de erros padronizados"]
+    end
+
+    mysql[("Banco de Dados\n[Container: MySQL 8.0]\nArmazena dados transacionais do sistema")]
+    rabbit[("Broker de Mensagens\n[Container: RabbitMQ 3]\nFila assíncrona para envio de notificações por e-mail")]
+    s3[("Armazenamento de Imagens\n[Container: Amazon S3]\nArmazena fotos das joias cadastradas")]
+    brevo["Brevo\n[Container: Brevo API]\nServiço externo para envio de e-mails transacionais"]
+    viacep["ViaCEP\n[Container: ViaCEP API]\nServiço externo para consulta de CEPs"]
+
+    ctrl -->|"chama"| svc
+    svc -->|"delega"| strat
+    svc -->|"persiste imagens"| arq
+    svc -->|"DTO ↔ entidade"| dto
+    svc -->|"consultas"| repo
+    strat -->|"grava movimentação + ajusta saldo"| repo
+    rot -->|"gera alertas (maleta, peça parada, estoque)"| svc
+    repo --> model
+    model --> mysql
+    arq --> s3
+    svc -->|"publica evento"| prod
+    prod --> rabbit
+    rabbit -->|"entrega"| cons
+    cons -->|"HTTPS (fire-and-forget)"| brevo
+    feign -.->|"ViaCepClient — legado:<br/>rota não consumida pelo front"| viacep
+    sec -.->|"filtra requisições"| ctrl
+    exc -.->|"mapeia exceções de domínio"| ctrl
+
+    classDef comp fill:#85BBF0,stroke:#0B4884,color:#000
+    classDef dado fill:#DDDDDD,stroke:#6B6B6B,color:#000
+    classDef ext fill:#999999,stroke:#6B6B6B,color:#fff
+    class ctrl,svc,rot,strat,arq,dto,repo,model,prod,cons,feign,sec,exc comp
+    class mysql,rabbit,s3 dado
+    class brevo,viacep ext
 ```
 
-**Endpoints por domínio** (todos sob `localhost:8080`):
+### Observações por componente
+
+- **`strategy/movimentacao`** — `MovimentacaoService.cadastrar` escolhe a strategy
+  via `suporta(motivo)`; para um novo tipo de movimentação cria-se uma strategy nova
+  (nunca `if` no service). Os tipos atuais são `ENTRADA`, `SAIDA`, `REENTRADA`
+  (`TipoMovimentacaoEnum`).
+- **Maletas** — modeladas por `MovimentacaoRevendedora` (nome, `dataLimite`,
+  `StatusMaleta`: `ABERTO → EM_CONSIGNACAO → EM_ACERTO → FINALIZADA | ERRO`,
+  relação 1:N com `Movimentacao`); expostas sob `/vendas`.
+- **Notificações** — `NotificacaoBrevoService` / `MaletaNotificacaoService` /
+  `UsuarioNotificacaoService` → `NotificacaoProducer` → fila →
+  `CrmNotificadorConsumer` → `BrevoClient`. O registro de envio (evita reenvio)
+  fica em `NotificacaoEnvio`. O efeito é *fire-and-forget*: falha só loga.
+- **Segurança** — JWT stateless (`JJWT 0.12.6`); token no **cookie HttpOnly
+  `authToken`** (ou header `Authorization: Bearer`); rotas públicas em
+  `URLS_PERMITIDAS` (login, convites, swagger, actuator); admin via
+  `@PreAuthorize("hasAuthority('ROLE_ADMIN')")`; CORS fixo em
+  `localhost:5173` / `localhost:3000`.
+- **Dashboards** — `DashboardController` (`/dashboard`: top-cinco, giro-estoque,
+  motivos de saída/reentrada, top-5 mais frios, índice de peças frias) +
+  `DashboardComparacaoController` (`/api/dashboard/kpis-e-grafico`).
+
+### Mapeamento de endpoints (resumo)
 
 | Base | Operações |
 | --- | --- |
 | `/usuarios` | `POST` criar, `POST /login`, `POST /logout`, `GET`, `GET /me` |
-| `/joias` | `GET` (paginado), `GET /{id}`, `POST`, `PATCH /{id}` |
-| `/movimentacoes` | `GET`, `GET /{id}`, `POST` (multipart/form-data) |
-| `/vendas` | `GET`, `GET /{id}`, `PATCH /{id}`, `POST` |
-| `/revendedoras` | `GET`, `GET /{id}`, `POST`, `PUT /{id}`, `PATCH /{id}` |
-| `/fornecedores` | `GET`, `GET /{id}`, `POST`, `PUT /{id}`, `PATCH /{id}/status` |
-| `/enderecos` | CRUD + `GET /cep/{cep}` |
-| `/arquivos` | `PUT /joia/{joiaId}`, `DELETE /joia/{joiaId}`, `DELETE /{id}` |
-| `/categorias`, `/materiais`, `/banhos`, `/motivos-movimentacao` | `GET`, `GET /{id}`, `POST` |
+| `/usuarios/convites` | criar, reenviar, validar token, definir senha (primeiro acesso) |
+| `/joias` | `GET` paginado, `GET/{id}`, `POST`, `PATCH/{id}` |
+| `/movimentacoes` | `GET`, `GET/{id}`, `POST` (multipart/form-data) |
+| `/vendas` (maletas) | `GET`, `GET/{id}`, `PATCH/{id}`, `POST` |
+| `/revendedoras`, `/fornecedores` | CRUD + status |
+| `/enderecos` | CRUD + `GET /cep/{cep}` (ViaCEP — **legado**, o front consulta direto) |
+| `/arquivos` | upload/delete de foto por joia (S3) |
+| `/categorias`, `/materiais`, `/banhos`, `/motivos-movimentacao` | leitura + criação |
 | `/tipos-movimentacao`, `/status-maletas` | `GET` |
-| `/dashboard` | `/top-cinco`, `/giro-estoque`, `/graficos/motivos-saida`, `/graficos/motivos-reentrada`, `/top-cinco-mais-frios`, `/indice-pecas-frias` |
-
-Listagens usam `Pageable` com **`@PageableDefault(size = 10)`** — o padrão do projeto é 10.
-
-### Autenticação
-
-JWT stateless. Token chega pelo **cookie HttpOnly `authToken`** (prioridade) ou header
-`Authorization: Bearer`. Rotas públicas ficam em `URLS_PERMITIDAS`
-(`config/SecurityConfiguracao.java`): `/h2-console/**`, `/swagger-ui/**`,
-`/usuarios/login`, `/usuarios/logout`. Admin via `@PreAuthorize("hasAuthority('ROLE_ADMIN')")`.
-
-⚠️ CORS está **fixo** em `localhost:5173` e `localhost:3000`. Ajuste em `SecurityConfiguracao`,
-nunca no controller.
-
-### Convenções críticas (backend)
-
-- Mapeamento **manual** via classes `XMapper` com métodos estáticos `toEntity`,
-  `toResponse`, `of`. **Sem MapStruct.**
-- DTOs: predominam `XRequestDto`/`XResponseDto`; domínios novos (`joia`, `revendedora`)
-  usam `EntradaDto`/`SaidaDto`/`AtualizacaoDto`. **Copie o padrão do domínio vizinho.**
-- Erros: lance `NotFoundException`, `BadRequestException`, `ConflictException`,
-  `QtdInsuficienteException` e deixe o `GlobalExceptionHandler` mapear. **Não** faça
-  try/catch de domínio nos controllers.
-- `MovimentacaoService.cadastrar` escolhe a `MovimentacaoStrategy` via `suporta(motivo)`
-  e delega ao `MovimentacaoContext`. Para novo tipo de movimentação, crie uma strategy.
-- POJOs com getters/setters manuais; Lombok é exceção (9 arquivos). Siga o estilo do
-  arquivo que está editando.
-- Alguns pacotes têm **maiúsculas** (`service/Material`, `service/NotificacaoBrevo`,
-  `controller/DashEntradaXSaida`). Ao criar pasta, respeite o nome já usado pelo domínio.
-- Ainda se usa `jakarta.transaction.Transactional` em vários services — não padronize
-  sem necessidade.
-- CRM/e-mail: `RevendedoraService` publica `NotificacaoEventoDto` →
-  `CrmNotificadorConsumer` (`@Async @EventListener`) → `BrevoClient` (Feign).
-
-### Armadilhas de Spring Boot 4 / Spring 7
-
-Verifique `BackEnd/AGENTS.md` antes de escrever imports:
-
-- Jackson 3 é `tools.jackson.databind.ObjectMapper`. Não introduza mais Jackson 2.
-- Slices de teste: `org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest`
-  (não `org.springframework.boot.test.autoconfigure.*`).
-- Contexto de teste: `@MockitoBean` (não `@MockBean`).
-- `AntPathRequestMatcher` foi removido no Security 7 — use `requestMatchers(...)`.
-- Testes: services com `MockitoExtension` + `@Mock`/`@InjectMocks`; controllers com
-  `@WebMvcTest` + `@AutoConfigureMockMvc(addFilters = false)` + `@MockitoBean` para **cada**
-  dependência. H2 (`MODE=MySQL`) só para o teste de context load. Convenção forte:
-  `@Nested` por método e `@DisplayName` em português começando com "Deve ...".
+| `/dashboard`, `/api/dashboard` | métricas e gráficos |
 
 ---
 
-## 4. FrontEnd — React 19 + Vite
+## Nível 3 — Componentes do frontend (FrontEnd/caeca)
 
-Local: `FrontEnd/caeca/`. Deps: `axios`, `react-router-dom` 7, `lucide-react`.
-Sem TypeScript, sem testes, sem Storybook.
+```mermaid
+flowchart TD
+    subgraph spa["Aplicação Front-end\n[Container: React 19 + Vite 8 + Nginx Alpine]\nInterface web responsável pela interação com o sistema"]
+        routes["Rotas\n[Container: React Router 7]\nGerencia rotas, proteção de acesso, ErrorBoundary e navegação"]
+        layout["Layout\n[Container: Componentes de Estrutura]\nHeader, Footer, Layout e CardForm"]
+        ui["UI Components\n[Container: Componentes Reutilizáveis]\nBotões, Inputs, Selects, Modais e Toasts"]
+        pages["Páginas\n[Container: Páginas da Aplicação]\nLogin, Primeiro Acesso, Dashboard, Movimentações, Joias, Maletas e Contribuintes"]
+        hooks["Hooks & Utils\n[Container: Lógica Compartilhada]\nuseFetch, apiError, toastBus, fetchAllPages e Mappers"]
+        client["HTTP Client\n[Container: Axios]\nGerencia requisições com baseURL '/api', withCredentials e interceptor de autenticação"]
+        apis["API Services\n[Container: Camada de Integração]\nAbstrações por domínio para comunicação com o Back-end"]
+        viacepapi["ViaCEP Service\n[Container: Fetch API]\nConsulta direta à API ViaCEP sem uso do Axios"]
+    end
 
-```bash
-cd FrontEnd/caeca
-npm install
-npm run dev       # Vite dev server
-npm run build     # production build
-npm run lint      # eslint .
-npm run preview
+    api["Aplicação Back-end\n[Container: Java 21 + Spring Boot 4]\nAplicação principal que gerencia a conexão com banco de dados, API e mensageria"]
+    viacep["ViaCEP\n[Container: ViaCEP API]\nServiço externo responsável pela consulta de endereços por CEP"]
+
+    navegador["Navegador\n[Container: Navegador Web]\nInterface utilizada pelos usuários para acessar o sistema"]
+    navegador --> routes
+    routes --> pages
+    pages --> layout
+    pages --> ui
+    pages --> hooks
+    hooks --> apis
+    apis --> client
+    client -->|"JSON + Cookie authToken (HttpOnly)\n401 → limpa storage e redireciona para /login"| api
+    pages -->|"Autocompletar endereço por CEP"| viacepapi
+    viacepapi -->|"GET https://viacep.com.br/ws/{cep}/json/"| viacep
+
+    classDef comp fill:#85BBF0,stroke:#0B4884,color:#000
+    classDef ext fill:#999999,stroke:#6B6B6B,color:#fff
+    class routes,layout,ui,pages,hooks,client,apis,viacepapi comp
+    class api,viacep ext
 ```
 
-### Cliente HTTP
-
-`src/service/api.js`: axios com `baseURL: 'http://localhost:8080'` **hardcoded** e
-`withCredentials: true` (envia o cookie de auth). Interceptor global trata `401`
- limpando `localStorage` e redirecionando para `/login`.
-
-⚠️ O baseURL está fixo no código — não há `.env` / `VITE_*`. Para apontar para outro
-ambiente é preciso editar `api.js`.
-
-Camada de API por domínio em `src/service/*Api.js`; mappers de payload em `src/utils/*Mapper.js`;
-`src/utils/fetchAllPages.js` pagina até concatenar todas as páginas da API.
-
-### Rotas (`src/main.jsx`)
-
-Rotas sob `<ProtectedRoute>` + `<Layout>`:
-
-```
-/login
-/                                Home (dashboard)
-/contribuintes                  CadastroContribuintes
-/movimentacoes                   MovimentacaoEscolhas
-/movimentacoes/entrada           EntradaJoia
-/movimentacoes/entradaexistente  EntradaJoiaExistente
-/movimentacoes/reentrada         ReentradaJoia
-/movimentacoes/saida             SaidaJoia
-/joias                           InventarioProdutos
-/joias/:id                       JoiaDetalhes
-/joias/movimentacoes             MovimentacaoEstoque
-/joias/maletas                   Maletas
-/joias/maletas/:id               MaletaDetalhes
-```
-
-⚠️ **Nav do `Header.jsx` aponta para rotas não registradas**: `/perfil`,
-`/contribuintes/revendedoras`, `/contribuintes/fornecedores`, `/contribuintes/funcionarios`,
-`/historico/gerais`, `/metricas`. Clicar nelas não renderiza nada. Ao adicionar página,
-registre a rota em `main.jsx` **e** o link no `Header.jsx`.
-
-⚠️ `src/App.jsx` está vazio (renderiza `<></>`) — o roteamento real vive em `main.jsx`.
-Não use `App.jsx` como ponto de entrada.
-
-Estrutura: `components/{layout,ui,modals}`, `components/ProtectedRoute.jsx`,
-`hooks/useFetch.jsx`, `pages/*`, `styles/`, CSS Modules em `pages/home/Home.module.css`.
+- **Dev:** proxy do Vite (`/api → http://localhost:8080`, removendo o prefixo).
+  **Prod:** mesmo repasse no `nginx.conf` do container.
+- Rotas protegidas por `ProtectedRoute` (sessão derivada do cookie + perfil no
+  `localStorage`); `/login` e `/primeiro-acesso` são públicas.
 
 ---
 
-## 5. Infra — AWS
+## Nível 4 — Diagrama de implantação
 
-Terraform para rede/compute/storage/ALB; **CloudFormation para os buckets S3**.
+Infra gerida por **Terraform** (rede, compute, ALB, EFS) + **CloudFormation**
+(buckets S3 — SCP da conta impede o Terraform de gerenciá-los).
 
-### Comandos
+```mermaid
+flowchart TD
+    usuario["Usuário\n[Container: Navegador Web]\nAcessa o sistema Ca&Cá via navegador"] -->|"HTTPS"| internet["Internet\n[Container: Rede Pública]\nTráfego HTTPS entre usuário e infraestrutura"]
 
-```bash
-cd Infra
+    subgraph vpc["VPC — us-east-1 (2 AZs)"]
+        alb["Application Load Balancer\n[Container: AWS ALB]\nBalanceia o tráfego entre as instâncias Front-end"]
 
-# 1. Buckets S3 (CloudFormation) — PRIMEIRO
-aws cloudformation create-stack --stack-name caeca-s3 \
-  --template-body file://s3-buckets.yaml --region us-east-1
-aws cloudformation wait stack-create-complete --stack-name caeca-s3 --region us-east-1
+        subgraph fronts["EC2 - Front-end (front-1a / front-1b) — t3.small"]
+            nginx["Aplicação Front-end\n[Container: Nginx Alpine + Build React]\nServe arquivos estáticos e realiza proxy para a Aplicação Back-end"]
+        end
 
-# 2. Resto da infra (Terraform)
-terraform init && terraform plan && terraform apply
-terraform destroy
+        subgraph backs["EC2 - Back-end (back-1a / back-1b) — t2.small"]
+            boot["Aplicação Back-end\n[Container: Docker (eclipse-temurin:21-jre)]\nExecuta a API Spring Boot na porta 8080"]
+        end
+
+        subgraph dbs["EC2 - Banco de Dados (db-1a) — t3.small"]
+            mysqldb["Banco de Dados\n[Container: Docker (mysql:8.0)]\nArmazena dados transacionais do sistema"]
+        end
+
+        subgraph rmq["EC2 - Mensageria (rabbitmq-1a) — dedicada"]
+            rabbithost["Broker de Mensagens\n[Container: Docker (rabbitmq:3-management)]\nGerencia fila AMQP restrita ao Back-end"]
+        end
+
+        efs["Armazenamento Compartilhado\n[Container: Amazon EFS]\nCompartilha arquivos entre instâncias quando necessário"]
+    end
+
+    subgraph cfn["CloudFormation — caeca-s3"]
+        bktfotos[("Armazenamento de Imagens\n[Container: Amazon S3]\nArmazena fotos das joias — acesso público")]
+        bktlake[("Data Lake\n[Container: Amazon S3]\nArmazena dados em camadas Bronze / Silver / Gold")]
+    end
+
+    subgraph event["EventBridge + Lambda"]
+        cron["Agendador EventBridge\n[Container: Amazon EventBridge]\nDispara a função mensalmente: cron(0 9 1 * ? *)"]
+        lambdafn["Função de Ingestão Bronze\n[Container: AWS Lambda (Python 3.11)]\nExecuta ingestão para camada Bronze do Data Lake — Stub"]
+        cron --> lambdafn
+        lambdafn --> bktlake
+    end
+
+    usuario --> internet --> alb
+    alb --> nginx
+    nginx -->|"Proxy /api → backend:8080"| boot
+    boot -->|"Conexão JDBC (3306)"| mysqldb
+    boot -->|"AMQP (5672)"| rabbithost
+    boot -->|"SDK AWS v2 (S3)"| bktfotos
+    boot -.->|"Montagem EFS"| efs
+
+    classDef infra fill:#E9E9E9,stroke:#6B6B6B,color:#000
+    classDef dado fill:#DDDDDD,stroke:#6B6B6B,color:#000
+    classDef ext fill:#999999,stroke:#6B6B6B,color:#fff
+    classDef stub fill:#EEEEEE,stroke:#999999,color:#666,stroke-dasharray: 4 3
+    class alb,nginx,boot,mysqldb,rabbithost,efs,cron infra
+    class bktfotos,bktlake dado
+    class lambdafn stub
+    class usuario,internet ext
 ```
 
-⚠️ Os buckets usam `DeletionPolicy: Retain`: `delete-stack` **não** os remove. Para
-remover de verdade, esvazie com `aws s3 rb s3://<bucket> --force` antes.
+> Bootstrap por `user_data` (`cloud_init_{front,back,db,rabbitmq}.yaml`) — roda
+> apenas na criação da instância; mudanças exigem `terraform apply -replace`.
 
-⚠️ **Terraform não gerencia os buckets S3** (SCP da conta bloqueia leitura de object lock,
-o que impede o TF de gerenciá-los). É por isso que existem duas ferramentas.
+---
 
-⚠️ `terraform.tfstate` e `.backup` estão **versionados no git** — podem conter dados
-sensíveis. Não adicione mais segredos lá.
+## Fluxos dinâmicos
 
-### Recursos
+### 1. Autenticação (login → cookie HttpOnly)
 
-| Camada | Itens |
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as Usuário (navegador)
+    participant S as SPA React
+    participant A as API Spring Boot
+    participant D as MySQL
+
+    U->>S: informa e-mail e senha
+    S->>A: POST /usuarios/login
+    A->>D: valida credenciais
+    D-->>A: usuário + perfil (ROLE_ADMIN / ROLE_USER)
+    A-->>S: 200 + Set-Cookie: authToken (HttpOnly, SameSite=Strict)
+    S->>S: grava nome/perfil no localStorage e navega para /
+    Note over S,A: demais chamadas enviam o cookie automaticamente (withCredentials)
+    A-->>S: 401 (token ausente/inválido/expirado — JWT_VALIDITY 1800s)
+    S->>S: interceptor limpa storage e redireciona para /login
+```
+
+### 2. Movimentação de estoque (ex.: saída)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant O as Operadora
+    participant S as SPA (/movimentacoes/saida)
+    participant A as API
+    participant X as MovimentacaoContext
+    participant D as MySQL
+
+    O->>S: preenche formulário (joia, motivo, quantidade, fotos…)
+    S->>A: POST /movimentacoes (multipart/form-data)
+    A->>A: valida DTO + autentica (cookie JWT)
+    A->>X: executar(dto)
+    X->>X: seleciona strategy por suporta(motivo): SaidaStrategy
+    X->>D: grava Movimentacao e ajusta saldo da Joia
+    D-->>X: confirmado
+    X-->>A: Movimentacao
+    A-->>S: 201 + payload
+    S-->>O: toast de sucesso
+    Note over A,D: se quantidade insuficiente → QtdInsuficienteException<br/>GlobalExceptionHandler devolve 4xx
+```
+
+### 3. Notificação assíncrona (fila → Brevo)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Ctx as Serviço de negócio<br/>(Revendedora/Maleta/Estoque/Convite)
+    participant P as RabbitMqNotificacaoProducer
+    participant R as RabbitMQ<br/>caecaExchange → caecaFila
+    participant Cons as CrmNotificadorConsumer
+    participant F as BrevoClient (Feign)
+    participant B as Brevo
+    participant Rev as Revendedora
+
+    Ctx->>P: enviarMensagem(email, nome, templateId, params)
+    P->>R: publica NotificacaoEventoDto (routing key caecaKey)
+    R->>Cons: entrega na caecaFila (@RabbitListener)
+    Cons->>F: enviarEmailTransacional(apiKey, request)
+    F->>B: POST /v3/smtp/email
+    B-->>Rev: e-mail (boas-vindas, aniversário, estoque baixo,<br/>peça parada, consignação, vencimento de maleta, convite)
+    Note over Cons,F: fire-and-forget: falha só registra log,<br/>nunca derruba o request que originou o evento
+```
+
+### 4. Rotinas agendadas
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CR as Spring @Scheduled<br/>(America/Sao_Paulo)
+    participant RS as RotinaScheduler<br/>cron 0 0 8 * * *
+    participant ES as EstoqueRotinaMensalService<br/>cron 0 0 9 1 * *
+    participant MN as MaletaNotificacaoService /<br/>EstoqueNotificacaoService
+    participant P as Producer → RabbitMQ → Brevo
+    participant EB as EventBridge
+    participant L as Lambda bronze
+
+    CR->>RS: diário 08:00 — executa RotinaDiaria[]
+    RS->>MN: alertas de maleta (vencimento, consignação)
+    MN->>P: evento de notificação
+    CR->>ES: mensal dia 1 09:00 — joias paradas há N dias
+    ES->>P: notificação de peça parada / estoque baixo
+    EB->>L: cron(0 9 1 * ? *) — pipeline de dados
+    L->>L: grava data lake bronze (stub — ainda não implementado)
+```
+
+---
+
+## Legenda da notação
+
+| Símbolo | Significado |
 | --- | --- |
-| Rede | VPC, subnets públicas/privadas em 2 AZs, IGW, NAT, route tables, 3 NACLs |
-| Segurança | SGs separados para front / back / db |
-| Compute | 2× EC2 front (`t3.small`, nginx + node:22-alpine), 2× EC2 back (`t2.small`, `eclipse-temurin:21-jre-jammy`), 1× EC2 db (`t3.small`, `mysql:8.0`) |
-| Storage | EFS + mount targets, VPC endpoint S3 |
-| Balanceamento | ALB + target group do frontend |
-| Lambda | `funcao-python-bronze` (python3.11, **dummy/stub**), disparada por EventBridge `cron(0 9 1 * ? *)` |
+| Retângulo azul escuro | Pessoa / ator |
+| Retângulo azul | Sistema ou contêiner de software em execução |
+| Retângulo cinza | Sistema externo (fora do nosso controle) |
+| Elipse cinza | Dados / armazenamento (banco, bucket, fila) |
+| Retângulo tracejado | Componente previsto / stub (não implementado) |
+| Seta contínua | Comunicação síncrona (requisição) |
+| Seta pontilhada | Influência / dependência opcional |
+| Diagrama de sequência | Fluxo dinâmico (interação temporal) |
 
-Bootstrap das instâncias via `user_data` → `cloud_init_{front,back,db}.yaml` (instala
-Docker/Compose, nginx, JRE 21, MySQL e faz `docker pull` da imagem base).
-
-`Infra/local-stack/` contém scripts bash (`bootstrap.sh` + camadas `01-network.sh` …
-`04-validation.sh`) para subir uma infraestrutura **local/distribuída em camadas** para
-desenvolvimento.
-
-### Buckets
-
-| Bucket | Acesso |
-| --- | --- |
-| `bucket-fotos-caeca` | **público** (`PublicReadGetObject`) |
-| `bucket-bronze-caeca` | privado |
-| `bucket-silver-caeca` | privado |
-| `bucket-gold-caeca` | privado |
-
-Buckets `bronze/silver/gold` são a camada de data lake — casa com `analiseDados/`.
-
----
-
-## 6. analiseDados — pipeline de dados (não iniciado)
-
-Repositório existe, `bronze/` está **vazia**. Não há código, nem Glue, nem Athena,
-nem Step Functions. Os buckets `bronze/silver/gold` e a Lambda `funcao-python-bronze`
-(hoje stub) são os pontos de apoio previstos na arquitetura.
-
----
-
-## 7. Regras de operação para agentes
-
-1. **Trabalhe por repositório.** Um `git status` na raiz não existe. Sempre `cd` no
-   subrepo correto e confira a branch antes de commitar.
-2. **Não commite `.env`, segredos ou `.idea/`.** `Infra/terraform.tfstate` já está no
-   git — não faça pior que isso.
-3. **BackEnd:** rode `mvn verify` (não só `mvn test`) antes de propor PR — o gate de
-   branch coverage em 70% reprova builds incompletos.
-4. **Ao criar property obrigatória sem default**, replique em
-   `src/test/resources/application.properties`.
-5. **Ao criar rota no front**, registre em `main.jsx` e adicione o link no `Header.jsx`.
-6. **Novo tipo de movimentação** vai como `MovimentacaoStrategy` nova, não como `if` no service.
-7. **Novo endpoint** precisa ser adicionado explicitamente a `URLS_PERMITIDAS` se for público.
-8. **Mapeamento de entidade↔DTO** é manual; não introduza MapStruct.
-9. **Commits:** Conventional Commits em português. Branches `feat/...`, `refactor/...`,
-   `chore/...` a partir de `main`, com PR para `main`.
-   Exemplos: `feat: adiciona paginação com tamanho 10`, `refactor: aplicando solids`.
-10. **Idioma:** domínio, comentários, `@DisplayName`, commits e PRs em português.
+Modelo alinhado ao C4 de Simon Brown: **Contexto (1)** → **Contêineres (2)** →
+**Componentes (3)** → **Código/Implantação (4)**, mais vistas dinâmicas
+(sequência) para os fluxos críticos.
